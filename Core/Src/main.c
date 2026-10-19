@@ -21,6 +21,16 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "bm_config.h"
+#include "bm_io.h"
+#include "bm_app.h"
+#include "adc_reader.h"
+#include "temperature_sensor.h"
+#include "cell_meas.h"
+#include "tle9015.h"
+#include "eis.h"
+#include "i2c_comm.h"
+#include "uart_comm.h"
 
 /* USER CODE END Includes */
 
@@ -44,7 +54,7 @@ ADC_HandleTypeDef hadc1;
 
 I2C_HandleTypeDef hi2c1;
 
-RTC_HandleTypeDef hrtc;
+IWDG_HandleTypeDef hiwdg;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
@@ -61,7 +71,7 @@ static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_FLASH_Init(void);
-static void MX_RTC_Init(void);
+static void MX_IWDG_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -105,8 +115,26 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   MX_FLASH_Init();
-  MX_RTC_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
+
+#if defined(HAL_IWDG_MODULE_ENABLED) && defined(__HAL_DBGMCU_FREEZE_IWDG)
+  /* stop the watchdog while the debugger halts the core */
+#if defined(__HAL_RCC_DBGMCU_CLK_ENABLE)
+  __HAL_RCC_DBGMCU_CLK_ENABLE();
+#endif
+  __HAL_DBGMCU_FREEZE_IWDG();
+#endif
+
+  BmConfig_Load();      /* I2C address, number of TLE9010, current zero (flash) */
+  BmIo_Init();          /* CONNECT_Z off, TLE9015 awake, ERRQ cleared */
+  AdcReader_Init();     /* ADC self-calibration before the first conversion */
+  TempSensor_Init();
+  CellMeas_Init();
+  Tle_Init();           /* USART2: 1 MBaud, MSB first */
+  EIS_Init();
+  I2cComm_Init();
+  UartComm_Init();      /* debug console on USART1 (FT231X / USB) */
 
   /* USER CODE END 2 */
 
@@ -117,6 +145,17 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    TempSensor_Process();
+    CellMeas_Process();
+    EIS_Process();
+    App_Process();
+    I2cComm_Update();
+    UartComm_Update();
+    BmIo_Process(EIS_IsBusy(), App_GetErrorCode() != APP_ERR_NONE);
+
+#ifdef HAL_IWDG_MODULE_ENABLED
+    HAL_IWDG_Refresh(&hiwdg);
+#endif
   }
   /* USER CODE END 3 */
 }
@@ -130,14 +169,14 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_0);
+  __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_1);
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSIDiv = RCC_HSI_DIV4;
+  RCC_OscInitStruct.HSIDiv = RCC_HSI_DIV1;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
@@ -154,7 +193,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -181,7 +220,7 @@ static void MX_ADC1_Init(void)
   /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
   */
   hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc1.Init.ScanConvMode = ADC_SCAN_SEQ_FIXED;
@@ -195,7 +234,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.DMAContinuousRequests = DISABLE;
   hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
-  hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_1CYCLE_5;
+  hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_160CYCLES_5;
   hadc1.Init.OversamplingMode = DISABLE;
   hadc1.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
@@ -245,8 +284,6 @@ static void MX_FLASH_Init(void)
 
   /* USER CODE END FLASH_Init 0 */
 
-  FLASH_OBProgramInitTypeDef pOBInit = {0};
-
   /* USER CODE BEGIN FLASH_Init 1 */
 
   /* USER CODE END FLASH_Init 1 */
@@ -254,17 +291,7 @@ static void MX_FLASH_Init(void)
   {
     Error_Handler();
   }
-
-  /* Option Bytes settings */
-
   if (HAL_FLASH_OB_Unlock() != HAL_OK)
-  {
-    Error_Handler();
-  }
-  pOBInit.OptionType = OPTIONBYTE_USER;
-  pOBInit.USERType = OB_USER_NRST_MODE;
-  pOBInit.USERConfig = OB_RESET_MODE_GPIO;
-  if (HAL_FLASHEx_OBProgram(&pOBInit) != HAL_OK)
   {
     Error_Handler();
   }
@@ -298,7 +325,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x00402D41;
+  hi2c1.Init.Timing = 0x10805D88;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -331,39 +358,31 @@ static void MX_I2C1_Init(void)
 }
 
 /**
-  * @brief RTC Initialization Function
+  * @brief IWDG Initialization Function
   * @param None
   * @retval None
   */
-static void MX_RTC_Init(void)
+static void MX_IWDG_Init(void)
 {
 
-  /* USER CODE BEGIN RTC_Init 0 */
+  /* USER CODE BEGIN IWDG_Init 0 */
 
-  /* USER CODE END RTC_Init 0 */
+  /* USER CODE END IWDG_Init 0 */
 
-  /* USER CODE BEGIN RTC_Init 1 */
+  /* USER CODE BEGIN IWDG_Init 1 */
 
-  /* USER CODE END RTC_Init 1 */
-
-  /** Initialize RTC Only
-  */
-  hrtc.Instance = RTC;
-  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
-  hrtc.Init.AsynchPrediv = 127;
-  hrtc.Init.SynchPrediv = 255;
-  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
-  hrtc.Init.OutPutRemap = RTC_OUTPUT_REMAP_NONE;
-  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
-  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
-  hrtc.Init.OutPutPullUp = RTC_OUTPUT_PULLUP_NONE;
-  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  /* USER CODE END IWDG_Init 1 */
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_32;
+  hiwdg.Init.Window = 4095;
+  hiwdg.Init.Reload = 499;
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN RTC_Init 2 */
+  /* USER CODE BEGIN IWDG_Init 2 */
 
-  /* USER CODE END RTC_Init 2 */
+  /* USER CODE END IWDG_Init 2 */
 
 }
 
@@ -472,8 +491,10 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOA, CONNECT_Z_Pin|STATUS_LED1_Pin|STATUS_LED2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, NSLEEP_Pin|SEL1_Pin|SEL2_Pin|SEL3_Pin
-                          |SEL4_Pin|ERRQ_RES_Pin|ERRQ_EXT_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, NSLEEP_Pin|ERRQ_RES_Pin|ERRQ_EXT_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, SEL1_Pin|SEL2_Pin|SEL3_Pin|SEL4_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : CONNECT_Z_Pin STATUS_LED1_Pin STATUS_LED2_Pin */
   GPIO_InitStruct.Pin = CONNECT_Z_Pin|STATUS_LED1_Pin|STATUS_LED2_Pin;
@@ -500,7 +521,7 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin : ERRQ_Pin */
   GPIO_InitStruct.Pin = ERRQ_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(ERRQ_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
